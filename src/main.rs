@@ -4,12 +4,39 @@ use anyhow::Context;
 use std::{env::current_dir, process::Stdio};
 use tokio::io::AsyncBufReadExt;
 
+use crate::schema::{CoreConfig, DebugConfig, FlashingConfig};
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     run().await
 }
 
-// cargo debugger --package dioxus-cli --bin dioxus-bin -- serve --verbose --experimental-bundle-split --trace --release
+mod schema {
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct DebugConfig {
+        pub flashing_config: FlashingConfig,
+        pub chip: String,
+        pub core_configs: Vec<CoreConfig>,
+    }
+
+    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct FlashingConfig {
+        pub flashing_enabled: bool,
+    }
+
+    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    pub struct CoreConfig {
+        pub program_binary: String,
+    }
+}
+
+// cargo debug --package dioxus-cli --bin dioxus-bin -- serve --verbose --experimental-bundle-split --trace --release
+// cargo debug --chip stm32f446re
 
 /// Run any of your workspace's binaries with the debugger attached.
 ///
@@ -17,16 +44,18 @@ async fn main() -> anyhow::Result<()> {
 async fn run() -> anyhow::Result<()> {
     let mut all_args: Vec<String> = std::env::args().collect();
 
-    // if running as cargo debugger, then remove the debugger arg
-    if all_args.get(1) == Some(&"debugger".to_string()) {
+    // if running as cargo debug, then remove the debugger arg
+    if all_args.get(1) == Some(&"debug".to_string()) {
         all_args.remove(1);
     }
 
     let mut parsing_cargo_args = true;
     let mut parsing_env_args = true;
+    let mut parsing_chip_arg = false;
     let mut cargo_args = vec![];
     let mut process_env_args = vec![];
     let mut rest_args = vec![];
+    let mut chip: Option<String> = None;
 
     println!("all args: {:?}", all_args);
 
@@ -34,6 +63,22 @@ async fn run() -> anyhow::Result<()> {
         // Switch to parsing the rest of the args
         if arg == "--" && parsing_cargo_args {
             parsing_cargo_args = false;
+            continue;
+        }
+
+        if arg.starts_with("-") {
+            parsing_chip_arg = false;
+        }
+
+        if parsing_chip_arg {
+            chip = Some(arg.clone());
+            parsing_chip_arg = false;
+            continue;
+        }
+
+        if arg == "--chip" {
+            chip = Some("".to_string());
+            parsing_chip_arg = true;
             continue;
         }
 
@@ -63,7 +108,7 @@ async fn run() -> anyhow::Result<()> {
     }
 
     if cargo_args.iter().any(|arg| arg == "--help") {
-        println!("cargo debugger [cargo args] -- [env1=val1 env2=val2] [executable args]");
+        println!("cargo debug [cargo args] -- [env1=val1 env2=val2] [executable args]");
         return Ok(());
     }
 
@@ -136,13 +181,32 @@ async fn run() -> anyhow::Result<()> {
         .collect::<Vec<_>>()
         .join(", ");
 
-    let url = format!(
-        "vscode://vadimcn.vscode-lldb/launch/config?{{ 'cwd': {cwd}, 'program': {program}, 'args': [{args}], 'env': {{ {env} }} }}",
-        cwd = cur_dir.canonicalize()?.to_str().unwrap(),
-        program = output_location,
-        args = args,
-        env = env
-    );
+    let url = if let Some(chip) = chip {
+        let config = serde_json::ser::to_string(&DebugConfig {
+            flashing_config: FlashingConfig {
+                flashing_enabled: true,
+            },
+            chip: chip,
+            core_configs: vec![CoreConfig {
+                program_binary: output_location.to_string(),
+            }],
+        })?;
+
+        let config = url_escape::encode_query(&config);
+
+        format!(
+            "vscode://probe-rs.probe-rs-debugger/launch/config?{config}",
+            config = config,
+        )
+    } else {
+        format!(
+            "vscode://vadimcn.vscode-lldb/launch/config?{{ 'cwd': {cwd}, 'program': {program}, 'args': [{args}], 'env': {{ {env} }} }}",
+            cwd = cur_dir.canonicalize()?.to_str().unwrap(),
+            program = output_location,
+            args = args,
+            env = env
+        )
+    };
 
     tokio::process::Command::new(if cfg!(target_os = "windows") {
         "code.cmd"
