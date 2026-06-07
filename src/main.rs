@@ -32,6 +32,8 @@ mod schema {
     #[serde(rename_all = "camelCase")]
     pub struct CoreConfig {
         pub program_binary: String,
+        pub core_index: u8,
+        pub rtt_enabled: bool,
     }
 }
 
@@ -189,6 +191,8 @@ async fn run() -> anyhow::Result<()> {
             chip: chip,
             core_configs: vec![CoreConfig {
                 program_binary: output_location.to_string(),
+                core_index: 0,
+                rtt_enabled: true,
             }],
         })?;
 
