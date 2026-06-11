@@ -1,10 +1,11 @@
 #![doc = include_str!("../README.md")]
 
 use anyhow::Context;
-use std::{env::current_dir, process::Stdio};
-use tokio::io::AsyncBufReadExt;
+use serde::Serialize;
+use std::{collections::HashMap, process::Stdio};
+use tokio::{io::AsyncBufReadExt, process::Command};
 
-use crate::schema::{CoreConfig, DebugConfig, FlashingConfig};
+use crate::schema::{msvc, probe_rs};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -12,44 +13,94 @@ async fn main() -> anyhow::Result<()> {
 }
 
 mod schema {
-    use serde::{Deserialize, Serialize};
+    pub mod probe_rs {
+        use serde::{Deserialize, Serialize};
 
-    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct DebugConfig {
-        pub flashing_config: FlashingConfig,
-        pub chip: String,
-        pub core_configs: Vec<CoreConfig>,
+        #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct Config {
+            pub r#type: String,
+            pub request: String,
+            pub flashing_config: FlashingConfig,
+            pub chip: String,
+            pub core_configs: Vec<CoreConfig>,
+        }
+
+        #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct FlashingConfig {
+            pub flashing_enabled: bool,
+        }
+
+        #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct CoreConfig {
+            pub program_binary: String,
+            pub core_index: u8,
+            pub rtt_enabled: bool,
+        }
     }
 
-    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct FlashingConfig {
-        pub flashing_enabled: bool,
-    }
+    pub mod msvc {
+        use serde::{Deserialize, Serialize};
+        use std::collections::HashMap;
 
-    #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
-    #[serde(rename_all = "camelCase")]
-    pub struct CoreConfig {
-        pub program_binary: String,
-        pub core_index: u8,
-        pub rtt_enabled: bool,
+        #[derive(Default, Debug, Clone, PartialEq, Serialize, Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        pub struct Config {
+            pub r#type: String,
+            pub request: String,
+            pub program: String,
+            pub args: Vec<String>,
+            pub stop_at_entry: bool,
+            pub cwd: String,
+            pub environment: HashMap<String, String>,
+        }
     }
 }
 
-// cargo debug --package dioxus-cli --bin dioxus-bin -- serve --verbose --experimental-bundle-split --trace --release
-// cargo debug --chip stm32f446re
+fn code_cmd() -> Command {
+    tokio::process::Command::new(if cfg!(target_os = "windows") {
+        "code.cmd"
+    } else {
+        "code"
+    })
+}
+
+pub async fn launch<T>(config: &T) -> anyhow::Result<()>
+where
+    T: ?Sized + Serialize,
+{
+    let config = serde_json::ser::to_string(config)?;
+    let config = url_escape::encode_query(&config);
+
+    let url = format!(
+        "vscode://fabiospampinato.vscode-debug-launcher/launch?args={config}",
+        config = config,
+    );
+
+    code_cmd()
+        .args(["--open-url", &url])
+        .output()
+        .await
+        .context("Failed to launch code. The extension may need to be installed with `cargo debug --install`")?;
+
+    Ok(())
+}
 
 /// Run any of your workspace's binaries with the debugger attached.
 ///
 /// cdb serve
 async fn run() -> anyhow::Result<()> {
-    let mut all_args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().collect();
 
-    // if running as cargo debug, then remove the debugger arg
-    if all_args.get(1) == Some(&"debug".to_string()) {
-        all_args.remove(1);
-    }
+    let args = if let Some(arg) = args.get(1)
+        && arg == "debug"
+    {
+        &args[1..]
+    } else {
+        &args[..]
+    };
 
     let mut parsing_cargo_args = true;
     let mut parsing_env_args = true;
@@ -59,9 +110,7 @@ async fn run() -> anyhow::Result<()> {
     let mut rest_args = vec![];
     let mut chip: Option<String> = None;
 
-    println!("all args: {:?}", all_args);
-
-    for arg in all_args.iter().skip(1) {
+    for arg in args.iter().skip(1) {
         // Switch to parsing the rest of the args
         if arg == "--" && parsing_cargo_args {
             parsing_cargo_args = false;
@@ -111,8 +160,12 @@ async fn run() -> anyhow::Result<()> {
 
     if cargo_args.iter().any(|arg| arg == "--help") {
         println!("cargo debug [cargo args] -- [env1=val1 env2=val2] [executable args]");
+
         return Ok(());
     }
+
+    // println!("cargo args: {:?}", cargo_args);
+    // println!("rest args: {:?}", rest_args);
 
     let mut child = tokio::process::Command::new("cargo")
         .arg("rustc")
@@ -169,58 +222,37 @@ async fn run() -> anyhow::Result<()> {
     let output_location =
         output_location.context("Failed to find output location. Build must've failed.")?;
 
-    let cur_dir = current_dir().context("Failed to get current directory")?;
-
-    let args = rest_args
-        .iter()
-        .map(|arg| format!("'{}'", urlencoding::encode(arg)))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let env = process_env_args
-        .iter()
-        .map(|(k, v)| format!("'{}': '{}'", k, urlencoding::encode(v)))
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    let url = if let Some(chip) = chip {
-        let config = serde_json::ser::to_string(&DebugConfig {
-            flashing_config: FlashingConfig {
+    if let Some(chip) = chip {
+        let config = probe_rs::Config {
+            r#type: "probe-rs-debug".to_string(),
+            request: "launch".to_string(),
+            flashing_config: probe_rs::FlashingConfig {
                 flashing_enabled: true,
             },
             chip: chip,
-            core_configs: vec![CoreConfig {
+            core_configs: vec![probe_rs::CoreConfig {
                 program_binary: output_location.to_string(),
                 core_index: 0,
                 rtt_enabled: true,
             }],
-        })?;
+        };
 
-        let config = url_escape::encode_query(&config);
-
-        format!(
-            "vscode://probe-rs.probe-rs-debugger/launch/config?{config}",
-            config = config,
-        )
+        launch(&config).await?;
     } else {
-        format!(
-            "vscode://vadimcn.vscode-lldb/launch/config?{{ 'cwd': {cwd}, 'program': {program}, 'args': [{args}], 'env': {{ {env} }} }}",
-            cwd = cur_dir.canonicalize()?.to_str().unwrap(),
-            program = output_location,
-            args = args,
-            env = env
-        )
-    };
+        // TODO: launch another debugger type on unix
 
-    tokio::process::Command::new(if cfg!(target_os = "windows") {
-        "code.cmd"
-    } else {
-        "code"
-    })
-    .args(["--open-url", &url])
-    .output()
-    .await
-    .context("Failed to launch code")?;
+        let config = msvc::Config {
+            r#type: "cppvsdbg".to_string(),
+            request: "launch".to_string(),
+            program: output_location.to_string(),
+            args: rest_args,
+            stop_at_entry: false,
+            cwd: "${workspaceRoot}".to_string(),
+            environment: HashMap::new(),
+        };
+
+        launch(&config).await?;
+    }
 
     Ok(())
 }
